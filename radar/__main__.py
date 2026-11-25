@@ -57,17 +57,27 @@ SKIPPABLE = {"x", "hf", "breakout", "sitemaps", "newsites", "revenue", "asks", "
              "feeds", "builders", "money", "sidelights"}
 
 
-def run(fn, skip: bool = False) -> dict:
-    """One signal failing still leaves a report: its error takes its place. Each block keeps how long it took."""
+def run(fn, skip: bool = False, label: str = "") -> dict:
+    """One signal failing still leaves a report: its error takes its place. Each block keeps how long it took.
+    Progress goes to stderr while it happens, since `daily` can run for minutes: a start line, then a done line."""
     if skip:
         return {"skipped": True}
+    name = label or getattr(fn, "__name__", "task")
+    print(f"[{time.strftime('%H:%M:%S')}] {name}: start", file=sys.stderr, flush=True)
     start = time.monotonic()
     try:
         out = fn()
     except Exception as exc:  # noqa: BLE001
         out = {"error": f"{type(exc).__name__}: {' '.join(str(exc).split())[:160]}"}
+    seconds = round(time.monotonic() - start)
     if isinstance(out, dict):
-        out["seconds"] = round(time.monotonic() - start)
+        out["seconds"] = seconds
+    if isinstance(out, dict) and out.get("error"):
+        print(f"[{time.strftime('%H:%M:%S')}] {name}: failed after {seconds}s ({out['error']})", file=sys.stderr, flush=True)
+    elif isinstance(out, dict) and out.get("skipped"):
+        print(f"[{time.strftime('%H:%M:%S')}] {name}: skipped", file=sys.stderr, flush=True)
+    else:
+        print(f"[{time.strftime('%H:%M:%S')}] {name}: done in {seconds}s", file=sys.stderr, flush=True)
     return out
 
 
@@ -80,11 +90,11 @@ def _finish(args, text: str, subject: str) -> None:
 
 
 def cmd_sources(args, cfg: dict, state: Path) -> int:
-    blocks = {"x": run(lambda: sources.x_new(cfg, state), "x" in args.skip),
-              "hf": run(lambda: sources.hf_new(cfg, state), "hf" in args.skip)}
+    blocks = {"x": run(lambda: sources.x_new(cfg, state), "x" in args.skip, label="x"),
+              "hf": run(lambda: sources.hf_new(cfg, state), "hf" in args.skip, label="hf")}
     lead, judged = report.leads(cfg, blocks)
     conn = store.connect(state)
-    extra = {"judge": judged, "record": run(lambda: {"recorded": store.record(conn, report.to_record(cfg, lead))})}
+    extra = {"judge": judged, "record": run(lambda: {"recorded": store.record(conn, report.to_record(cfg, lead))}, label="record")}
     errors = any(b.get("error") for b in (*blocks.values(), *extra.values()))
     if report.named(cfg, lead) or errors:
         _finish(args, report.sources(cfg, lead, blocks, extra), f"New-term radar · sources {date.today()}")
@@ -96,48 +106,51 @@ def cmd_sources(args, cfg: dict, state: Path) -> int:
 def cmd_daily(args, cfg: dict, state: Path) -> int:
     weekly = args.new_sites or date.today().weekday() == cfg["new_sites"]["weekday"]
     blocks = {
-        "x": run(lambda: sources.x_new(cfg, state), "x" in args.skip),
-        "hf": run(lambda: sources.hf_new(cfg, state), "hf" in args.skip),
-        "breakout": run(lambda: breakout.breakouts(cfg, state), "breakout" in args.skip),
-        "sitemap": run(lambda: sitemaps.diff(cfg, state), "sitemaps" in args.skip),
-        "newsite": run(lambda: new_sites.new_sites(cfg, state), "newsites" in args.skip or not weekly),
+        "x": run(lambda: sources.x_new(cfg, state), "x" in args.skip, label="x"),
+        "hf": run(lambda: sources.hf_new(cfg, state), "hf" in args.skip, label="hf"),
+        "breakout": run(lambda: breakout.breakouts(cfg, state), "breakout" in args.skip, label="breakout"),
+        "sitemap": run(lambda: sitemaps.diff(cfg, state), "sitemaps" in args.skip, label="sitemaps"),
+        "newsite": run(lambda: new_sites.new_sites(cfg, state), "newsites" in args.skip or not weekly,
+                       label="newsites"),
         "revenue": run(lambda: revenue.products(cfg, state), "revenue" in args.skip or not (
-            args.revenue or date.today().weekday() == cfg["revenue"]["weekday"])),
+            args.revenue or date.today().weekday() == cfg["revenue"]["weekday"]), label="revenue"),
         "ask": run(lambda: asks.asks(cfg, state), "asks" in args.skip or not (
-            args.asks or date.today().weekday() == cfg["asks"]["weekday"])),
+            args.asks or date.today().weekday() == cfg["asks"]["weekday"]), label="asks"),
         "seller": run(lambda: sellers.sellers(cfg, state), "sellers" in args.skip or not (
-            args.sellers or date.today().weekday() == cfg["sellers"]["weekday"])),
+            args.sellers or date.today().weekday() == cfg["sellers"]["weekday"]), label="sellers"),
         "builder": run(lambda: sellers.builders(cfg, state), "builders" in args.skip or not (
-            args.sellers or date.today().weekday() == cfg["builders"]["weekday"])),
-        "feed": run(lambda: feeds.feeds(cfg, state, weekly=args.feeds), "feeds" in args.skip),
+            args.sellers or date.today().weekday() == cfg["builders"]["weekday"]), label="builders"),
+        "feed": run(lambda: feeds.feeds(cfg, state, weekly=args.feeds), "feeds" in args.skip, label="feeds"),
     }
-    found = run(lambda: gsc.gsc_new(cfg), "gsc" in args.skip)
+    found = run(lambda: gsc.gsc_new(cfg), "gsc" in args.skip, label="gsc")
     lead, judged = report.leads(cfg, blocks)
     conn = store.connect(state)
-    extra = {"judge": judged, "record": run(lambda: {"recorded": store.record(conn, report.to_record(cfg, lead))})}
+    extra = {"judge": judged, "record": run(lambda: {"recorded": store.record(conn, report.to_record(cfg, lead))}, label="record")}
     # What the viewers of a widely shared walkthrough ask for: the one-click tool behind a ⚡ lead.
     extra["tutorials"] = run(lambda: pains.tutorial_asks(cfg, report.named(cfg, lead)),
-                             "tutorials" in args.skip or not cfg["tutorials"]["max_leads"])
+                             "tutorials" in args.skip or not cfg["tutorials"]["max_leads"], label="tutorials")
     # With ① run apart, the daily report lists what that job kept since yesterday.
-    extra["recent_sources"] = run(lambda: {"rows": store.recent_sources(conn)}, not {"x", "hf"} <= args.skip)
+    extra["recent_sources"] = run(lambda: {"rows": store.recent_sources(conn)}, not {"x", "hf"} <= args.skip,
+                                  label="recent sources")
     # The names to read for their generic terms: things, not words that surged (usecases.names_to_read).
     names = usecases.names_to_read(report.to_record(cfg, lead), extra["recent_sources"].get("rows", []))
     repos = {r["term"]: r["repo"] for r in lead if r.get("repo")}
     about = {r["term"]: r["about"] for r in lead if r.get("about")}      # a paying product's own description
     extra["usecases"] = run(lambda: usecases.run(cfg, state, list(dict.fromkeys(names)), repos, texts=about),
-                            "usecases" in args.skip or not cfg["usecases"]["per_day"])
-    run(lambda: store.record(conn, report.usecase_leads(extra["usecases"])))
+                            "usecases" in args.skip or not cfg["usecases"]["per_day"], label="usecases")
+    run(lambda: store.record(conn, report.usecase_leads(extra["usecases"])), label="record usecases")
     # Side evidence spends its whois lookups on the names people search most, by the table's own estimate.
     extra["sidelights"] = run(lambda: sidelights.evidence(cfg["sidelights"], by_searches(list(dict.fromkeys(names)), extra["usecases"])),
-                              "sidelights" in args.skip)
+                              "sidelights" in args.skip, label="sidelights")
     # ⑩ waits for the keyword table: an AdSense ID belongs to an established site, and the tool sites already on
     # page one for the day's terms are the established ones; ⑥'s and ⑧'s products come after them.
     blocks["money"] = run(lambda: money.money(cfg, state, page_one_tools(extra["usecases"], cfg["money"]["max_dr"]) + paying_sites(blocks)),
-                          "money" in args.skip or not (args.sellers or args.revenue or date.today().weekday() == cfg["money"]["weekday"]))
+                          "money" in args.skip or not (args.sellers or args.revenue or date.today().weekday() == cfg["money"]["weekday"]),
+                          label="money")
     extra["tails"] = run(lambda: sidelights.tails(cfg["sidelights"], paying_names(blocks)),
-                         "sidelights" in args.skip or not paying_names(blocks))
-    rev = run(lambda: review.review(cfg, conn), "review" in args.skip)
-    summ = run(lambda: store.summary(conn))
+                         "sidelights" in args.skip or not paying_names(blocks), label="tails")
+    rev = run(lambda: review.review(cfg, conn), "review" in args.skip, label="review")
+    summ = run(lambda: store.summary(conn), label="summary")
     text = report.daily(cfg, lead, blocks, found, rev, summ, extra)
     if args.out:
         Path(args.out).with_suffix(".json").write_text(json.dumps(
